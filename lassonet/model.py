@@ -8,7 +8,7 @@ from .prox import inplace_prox, inplace_group_prox, prox
 
 
 class LassoNet(nn.Module):
-    def __init__(self, *dims, groups=None, dropout=None):
+    def __init__(self, *dims, groups=None, dropout=None, bias=False):
         """
         first dimension is input
         last dimension is output
@@ -31,9 +31,14 @@ class LassoNet(nn.Module):
 
         super().__init__()
 
+        self.dims = dims
+        self.bias = bias
         self.dropout = nn.Dropout(p=dropout) if dropout is not None else None
         self.layers = nn.ModuleList(
-            [nn.Linear(dims[i], dims[i + 1]) for i in range(len(dims) - 1)]
+            [
+                nn.Linear(dims[i], dims[i + 1], bias=bias)
+                for i in range(len(dims) - 1)
+            ]
         )
         self.skip = nn.Linear(dims[0], dims[-1], bias=False)
 
@@ -131,4 +136,6 @@ class LassoNet(nn.Module):
         return self.input_mask().sum().item()
 
     def cpu_state_dict(self):
-        return {k: v.detach().clone().cpu() for k, v in self.state_dict().items()}
+        return {
+            k: v.detach().clone().cpu() for k, v in self.state_dict().items()
+        }

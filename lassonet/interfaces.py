@@ -78,6 +78,7 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         torch_seed=None,
         class_weight=None,
         tie_approximation=None,
+        bias=False,
     ):
         """
         Parameters
@@ -139,6 +140,7 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
             There must be one number per class.
         tie_approximation: str
             Tie approximation for the Cox model, must be one of ("breslow", "efron").
+            Bias: whether or not the model should include a bias.
         """
         assert isinstance(hidden_dims, tuple), "`hidden_dims` must be a tuple"
         self.hidden_dims = hidden_dims
@@ -177,7 +179,9 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         self.val_size = val_size
 
         if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
         self.device = device
 
         self.verbose = verbose
@@ -188,12 +192,15 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         self.model = None
         self.class_weight = class_weight
         self.tie_approximation = tie_approximation
+        self.bias = bias
 
         if self.class_weight is not None:
             assert isinstance(
                 self, LassoNetClassifier
             ), "Weighted loss is only for classification"
-            self.class_weight = torch.FloatTensor(self.class_weight).to(self.device)
+            self.class_weight = torch.FloatTensor(self.class_weight).to(
+                self.device
+            )
             self.criterion = torch.nn.CrossEntropyLoss(
                 weight=self.class_weight, reduction="mean"
             )
@@ -234,6 +241,7 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
             output_shape,
             groups=self.groups,
             dropout=self.dropout,
+            bias=self.bias,
         ).to(self.device)
 
     def _cast_input(self, X, y=None):
@@ -248,7 +256,9 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         Note that if `lambda_` is not given, the trained model
         will most likely not use any feature.
         """
-        self.path_ = self.path(X, y, X_val=X_val, y_val=y_val, return_state_dicts=False)
+        self.path_ = self.path(
+            X, y, X_val=X_val, y_val=y_val, return_state_dicts=False
+        )
         return self
 
     def _train(
@@ -315,7 +325,9 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
                         print(
                             f"Loss: {self.criterion(model(X_train[batch]), y_train[batch])}"
                         )
-                        print(f"l2_regularization: {model.l2_regularization()}")
+                        print(
+                            f"l2_regularization: {model.l2_regularization()}"
+                        )
                         print(
                             f"l2_regularization_skip: {model.l2_regularization_skip()}"
                         )
@@ -325,7 +337,9 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
                     return ans
 
                 optimizer.step(closure)
-                model.prox(lambda_=lambda_ * optimizer.param_groups[0]["lr"], M=self.M)
+                model.prox(
+                    lambda_=lambda_ * optimizer.param_groups[0]["lr"], M=self.M
+                )
 
             if epoch == 0:
                 # fallback to running loss of first epoch
@@ -356,7 +370,9 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
             l2_regularization_skip = self.model.l2_regularization_skip()
         return HistoryItem(
             lambda_=lambda_,
-            state_dict=self.model.cpu_state_dict() if return_state_dict else None,
+            state_dict=self.model.cpu_state_dict()
+            if return_state_dict
+            else None,
             objective=loss + lambda_ * reg,
             loss=loss,
             val_objective=val_obj,
@@ -534,6 +550,7 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
                 output_shape,
                 groups=self.groups,
                 dropout=self.dropout,
+                bias=self.bias,
             ).to(self.device)
 
         self.model.load_state_dict(state_dict)
@@ -707,7 +724,10 @@ class BaseLassoNetCV(BaseLassoNet, metaclass=ABCMeta):
             lambda_seq=self.lambdas_[: best_lambda_idx + 1],
             return_state_dicts=return_state_dicts,
         )
-        if isinstance(self, LassoNetCoxRegressor) and not path[-1].selected.any():
+        if (
+            isinstance(self, LassoNetCoxRegressor)
+            and not path[-1].selected.any()
+        ):
             # condition to retrain and avoid having 0 feature which gives score 0
             # TODO: handle backtrack in path even when return_state_dicts=False
             path = super().path(
@@ -770,6 +790,8 @@ def lassonet_path(X, y, task, *, X_val=None, y_val=None, **kwargs):
         "cox": LassoNetCoxRegressor,
     }.get(task)
     if class_ is None:
-        raise ValueError('task must be "classification," "regression," or "cox')
+        raise ValueError(
+            'task must be "classification," "regression," or "cox'
+        )
     model = class_(**kwargs)
     return model.path(X, y, X_val=X_val, y_val=y_val)
