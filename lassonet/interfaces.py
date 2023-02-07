@@ -319,19 +319,7 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
                         + self.gamma * model.l2_regularization()
                         + self.gamma_skip * model.l2_regularization_skip()
                     )
-                    if ans + 1 == ans:
-                        print(f"Loss is {ans}", file=sys.stderr)
-                        print(f"Did you normalize input?", file=sys.stderr)
-                        print(
-                            f"Loss: {self.criterion(model(X_train[batch]), y_train[batch])}"
-                        )
-                        print(
-                            f"l2_regularization: {model.l2_regularization()}"
-                        )
-                        print(
-                            f"l2_regularization_skip: {model.l2_regularization_skip()}"
-                        )
-                        assert False
+
                     ans.backward()
                     loss += ans.item() * len(batch) / n_train
                     return ans
