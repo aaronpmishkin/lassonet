@@ -463,10 +463,23 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         lambda_seq = iter(lambda_seq)
         lambda_start = next(lambda_seq)
 
+        # start optimization from sparse according to path
+        # multiplier.
+        if self.path_multiplier < 1:
+            self.model.skip.weight.data.fill_(0.0)
+            self.model.layers[0].weight.data.fill_(0.0)
+
         is_dense = True
         for current_lambda in itertools.chain([lambda_start], lambda_seq):
-            if self.model.selected_count() == 0:
+            if self.model.selected_count() == 0 and self.path_multiplier > 1:
                 break
+            elif (
+                not is_dense
+                and self.model.selected_count() == X.shape[1]
+                and self.path_multiplier < 1
+            ):
+                break
+
             last = self._train(
                 X_train,
                 y_train,
