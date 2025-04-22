@@ -1,10 +1,9 @@
 from functools import partial
 
 import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
-
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
 from lassonet import LassoNetRegressor, plot_path
 
@@ -31,7 +30,7 @@ def strong_linear():
     linear = X.dot(coef)
     noise = np.random.randn(n)
     x1, x2, x3, *_ = X.T
-    nonlinear = 2 * (x1 ** 3 - 3 * x1) + 4 * (x2 ** 2 * x3 - x3)
+    nonlinear = 2 * (x1**3 - 3 * x1) + 4 * (x2**2 * x3 - x3)
     y = 6 * linear + 8 * noise + nonlinear
     return X, y
 
@@ -58,7 +57,7 @@ for generator in [linear, strong_linear, friedman_lockout]:
 
     model = LassoNetRegressor(verbose=True, path_multiplier=1.01, hidden_dims=(10, 10))
 
-    path = model.path(X_train, y_train)
+    path = model.path(X_train, y_train, return_state_dicts=True)
     import matplotlib.pyplot as plt
 
     def score(self, X, y, sample_weight=None):
@@ -67,5 +66,5 @@ for generator in [linear, strong_linear, friedman_lockout]:
 
     model.score = partial(score, model)
 
-    plot_path(model, path, X_test, y_test)
+    plot_path(model, X_test, y_test)
     plt.show()

@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .prox import inplace_prox, inplace_group_prox, prox
+from .prox import inplace_group_prox, inplace_prox, prox
 
 
 class LassoNet(nn.Module):
@@ -96,7 +96,6 @@ class LassoNet(nn.Module):
                         M=M,
                     )
                     if torch.abs(beta - new_beta).max() < 1e-5:
-                        # print(_)
                         break
                     beta = new_beta
                 return (torch.norm(beta, p=2, dim=0) == 0).sum()

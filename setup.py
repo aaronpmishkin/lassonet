@@ -1,5 +1,6 @@
-from setuptools import setup
 from pathlib import Path
+
+from setuptools import setup
 
 
 def read(fname):
@@ -8,7 +9,7 @@ def read(fname):
 
 setup(
     name="lassonet",
-    version="0.0.13",
+    version="0.0.20",
     author="Louis Abraham, Ismael Lemhadri",
     author_email="louis.abraham@yahoo.fr, lemhadri@stanford.edu",
     license="MIT",
@@ -30,6 +31,13 @@ setup(
         "sortedcontainers",
         "tqdm",
     ],
+    extras_require={
+        "dev": [
+            "pre-commit",
+            "sphinx",
+            "black",
+        ]
+    },
     tests_require=["pytest"],
     python_requires=">=3.8",
 )

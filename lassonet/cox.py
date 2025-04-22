@@ -11,7 +11,7 @@ from .utils import log_substract, scatter_logsumexp
 
 
 class CoxPHLoss(torch.nn.Module):
-    """Loss for CoxPH model. """
+    """Loss for CoxPH model."""
 
     allowed = ("breslow", "efron")
 
@@ -31,6 +31,9 @@ class CoxPHLoss(torch.nn.Module):
         events = events[idx]
 
         event_ind = events.nonzero().flatten()
+        if event_ind.nelement() == 0:
+            # return 0 while connecting the gradient
+            return log_h[:0].sum()
 
         # numerator
         log_num = log_h[event_ind].mean()

@@ -1,6 +1,11 @@
-from typing import Iterable
-import torch
+from itertools import zip_longest
+from typing import TYPE_CHECKING, Iterable, List
+
 import scipy.stats
+import torch
+
+if TYPE_CHECKING:
+    from lassonet.interfaces import HistoryItem
 
 
 def eval_on_path(model, path, X_test, y_test, *, score_function=None):
@@ -65,3 +70,43 @@ def confidence_interval(data, confidence=0.95):
         len(data) - 1,
         scale=scipy.stats.sem(data),
     )[1]
+
+
+def selection_probability(paths: List[List["HistoryItem"]]):
+    """Compute the selection probability of each feature at each step.
+    The individual curves are smoothed to that they are monotonically decreasing.
+
+    Input
+    -----
+    paths: List of List of HistoryItem
+        The lambda paths must be the same for all models.
+
+    Output
+    ------
+    prob: torch.Tensor
+        Tensor of shape (n_steps, n_features) containing the selection probability
+        of each feature at lambda value.
+    expected_wrong: tuple of (Tensor, LongTensor)
+        Expected number of wrong features.
+        (values, indices) where values are the expected number of wrong features
+        and indices are the order of the selected features.
+    """
+    n_models = len(paths)
+
+    prob = []
+    selected = torch.ones_like(paths[0][0].selected)
+    iterable = zip_longest(
+        *[[it.selected for it in path] for path in paths],
+        fillvalue=torch.zeros_like(paths[0][0].selected),
+    )
+    for its in iterable:
+        sel = sum(its) / n_models
+        selected = torch.minimum(selected, sel)
+        prob.append(selected)
+    prob = torch.stack(prob)
+
+    expected_wrong = (
+        prob.shape[1] * (prob.mean(dim=1, keepdim=True)) ** 2 / (2 * prob - 1)
+    )
+    expected_wrong[prob <= 0.5] = float("inf")
+    return prob, expected_wrong.min(axis=0).values.sort()

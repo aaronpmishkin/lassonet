@@ -1,13 +1,15 @@
-from itertools import islice
+import itertools
+import random
+import sys
+import warnings
 from abc import ABCMeta, abstractmethod, abstractstaticmethod
 from dataclasses import dataclass
 from functools import partial
-import itertools
-import sys
-from typing import List
-import warnings
+from itertools import islice
+from typing import List, Tuple
 
 import numpy as np
+import torch
 from sklearn.base import (
     BaseEstimator,
     ClassifierMixin,
@@ -15,11 +17,12 @@ from sklearn.base import (
     RegressorMixin,
 )
 from sklearn.model_selection import check_cv, train_test_split
-import torch
 from tqdm import tqdm
 
-from .model import LassoNet
+from lassonet.utils import selection_probability
+
 from .cox import CoxPHLoss, concordance_index
+from .model import LassoNet
 
 
 def abstractattr(f):
@@ -94,7 +97,7 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
             Note: lambda_start and path_multiplier will be ignored.
         gamma : float, default=0.0
             l2 penalization on the network
-        gamma : float, default=0.0
+        gamma_skip : float, default=0.0
             l2 penalization on the skip connection
         path_multiplier : float, default=1.02
             Multiplicative factor (:math:`1 + \\epsilon`) to increase
@@ -115,7 +118,7 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
             Maximum number of training epochs for initial training and path computation.
             This is an upper-bound on the effective number of epochs, since the model
             uses early stopping.
-        patience : int or pair of int or None, default=10
+        patience : int or pair of int or None, default=(100, 10)
             Number of epochs to wait without improvement during early stopping.
         tol : float, default=0.99
             Minimum improvement for early stopping: new objective < tol * old objective.
@@ -140,7 +143,7 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
             There must be one number per class.
         tie_approximation: str
             Tie approximation for the Cox model, must be one of ("breslow", "efron").
-            Bias: whether or not the model should include a bias.
+        Bias: whether or not the model should include a bias.
         """
         assert isinstance(hidden_dims, tuple), "`hidden_dims` must be a tuple"
         self.hidden_dims = hidden_dims
@@ -231,8 +234,6 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
     def _init_model(self, X, y):
         """Create a torch model"""
         output_shape = self._output_shape(y)
-        if self.class_weight is not None:
-            assert output_shape == len(self.class_weight)
         if self.torch_seed is not None:
             torch.manual_seed(self.torch_seed)
         self.model = LassoNet(
@@ -245,19 +246,30 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         ).to(self.device)
 
     def _cast_input(self, X, y=None):
+        if hasattr(X, "to_numpy"):
+            X = X.to_numpy()
         X = torch.FloatTensor(X).to(self.device)
         if y is None:
             return X
+        if hasattr(y, "to_numpy"):
+            y = y.to_numpy()
         y = self._convert_y(y)
         return X, y
 
-    def fit(self, X, y, *, X_val=None, y_val=None):
+    def fit(self, X, y, *, X_val=None, y_val=None, dense_only=False):
         """Train the model.
         Note that if `lambda_` is not given, the trained model
         will most likely not use any feature.
+        If `dense_only` is True, will only train a dense model.
         """
+        lambda_seq = [] if dense_only else None
         self.path_ = self.path(
-            X, y, X_val=X_val, y_val=y_val, return_state_dicts=False
+            X,
+            y,
+            X_val=X_val,
+            y_val=y_val,
+            return_state_dicts=False,
+            lambda_seq=lambda_seq,
         )
         return self
 
@@ -314,24 +326,39 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
                 def closure():
                     nonlocal loss
                     optimizer.zero_grad()
+                    crit = self.criterion(model(X_train[batch]), y_train[batch])
                     ans = (
-                        self.criterion(model(X_train[batch]), y_train[batch])
+                        crit
                         + self.gamma * model.l2_regularization()
                         + self.gamma_skip * model.l2_regularization_skip()
                     )
-
+                    if not torch.isfinite(ans):
+                        print(f"Loss is {ans}", file=sys.stderr)
+                        print("Did you normalize input?", file=sys.stderr)
+                        print("Loss::", crit.item())
+                        print(
+                            "l2_regularization:",
+                            model.l2_regularization(),
+                        )
+                        print(
+                            "l2_regularization_skip:",
+                            model.l2_regularization_skip(),
+                        )
+                        assert False
                     ans.backward()
-                    loss += ans.item() * len(batch) / n_train
+                    loss += ans.item() * batch_size / n_train
                     return ans
 
                 optimizer.step(closure)
                 model.prox(
-                    lambda_=lambda_ * optimizer.param_groups[0]["lr"], M=self.M
+                    lambda_=lambda_ * optimizer.param_groups[0]["lr"],
+                    M=self.M,
                 )
 
             if epoch == 0:
                 # fallback to running loss of first epoch
                 real_loss = loss
+            model.eval()
             val_obj = validation_obj()
             if val_obj < self.tol * best_val_obj:
                 best_val_obj = val_obj
@@ -364,7 +391,7 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
             objective=loss + lambda_ * reg,
             loss=loss,
             val_objective=val_obj,
-            val_loss=val_obj - lambda_ * reg,
+            val_loss=val_obj - lambda_ * reg,  # TODO remove l2 reg
             regularization=reg,
             l2_regularization=l2_regularization,
             l2_regularization_skip=l2_regularization_skip,
@@ -385,14 +412,17 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         y_val=None,
         lambda_seq=None,
         lambda_max=float("inf"),
-        return_state_dicts=True,
+        return_state_dicts=False,
         callback=None,
+        disable_lambda_warning=False,
     ) -> List[HistoryItem]:
-        """Train LassoNet on a lambda\_ path.
+        """Train LassoNet on a lambda\\_ path.
         The path is defined by the class parameters:
         start at `lambda_start` and increment according to `path_multiplier`.
         The path will stop when no feature is being used anymore.
         callback will be called at each step on (model, history)
+
+        If you pass lambda_seq=[], only the dense model will be trained.
         """
         assert (X_val is None) == (
             y_val is None
@@ -413,21 +443,21 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
 
         # always init model
         self._init_model(X_train, y_train)
-
-        hist.append(
-            self._train(
-                X_train,
-                y_train,
-                X_val,
-                y_val,
-                batch_size=self.batch_size,
-                lambda_=0,
-                epochs=self.n_iters_init,
-                optimizer=self.optim_init(self.model.parameters()),
-                patience=self.patience_init,
-                return_state_dict=return_state_dicts,
+        if self.n_iters_init:
+            hist.append(
+                self._train(
+                    X_train,
+                    y_train,
+                    X_val,
+                    y_val,
+                    batch_size=self.batch_size,
+                    lambda_=0,
+                    epochs=self.n_iters_init,
+                    optimizer=self.optim_init(self.model.parameters()),
+                    patience=self.patience_init,
+                    return_state_dict=return_state_dicts,
+                )
             )
-        )
         if callback is not None:
             callback(self, hist)
         if self.verbose > 1:
@@ -455,13 +485,21 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
                     / optimizer.param_groups[0]["lr"]
                     / 10
                 )
+                if self.verbose > 1:
+                    print(f"lambda_start = {self.lambda_start_:.2e}")
                 lambda_seq = _lambda_seq(self.lambda_start_)
             else:
                 lambda_seq = _lambda_seq(self.lambda_start)
 
+        if not lambda_seq:
+            # support lambda_seq=[] to only train the dense model
+            return hist
+
         # extract first value of lambda_seq
         lambda_seq = iter(lambda_seq)
         lambda_start = next(lambda_seq)
+        while lambda_start == 0:
+            lambda_start = next(lambda_seq)
 
         # start optimization from sparse according to path
         # multiplier.
@@ -492,9 +530,9 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
                 patience=self.patience_path,
                 return_state_dict=return_state_dicts,
             )
-            if is_dense and self.model.selected_count() < X.shape[1]:
+            if is_dense and self.model.selected_count() < X_train.shape[1]:
                 is_dense = False
-                if current_lambda / lambda_start < 2:
+                if not disable_lambda_warning and current_lambda < 2 * lambda_start:
                     warnings.warn(
                         f"lambda_start={lambda_start:.3f} "
                         f"{'(selected automatically) ' * (self.lambda_start == 'auto')}"
@@ -516,7 +554,84 @@ class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
         self.feature_importances_ = self._compute_feature_importances(hist)
         """When does each feature disappear on the path?"""
 
+        self.path_ = hist
+
         return hist
+
+    def _stability_selection_path(self, X, y, lambda_seq=None) -> List[HistoryItem]:
+        """Compute a path on a random half of the data.
+        Used for stability selection.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data
+        y : array-like of shape (n_samples,) or (n_samples, n_outputs)
+            Target values
+        lambda_seq : iterable of float
+
+        Returns
+        -------
+        List[HistoryItem]
+        """
+        n = len(X)
+        shuffle = list(range(n))
+        random.shuffle(shuffle)
+        train_ind = shuffle[n // 2 : n]
+        return BaseLassoNet.path(
+            self, X[train_ind], y[train_ind], lambda_seq=lambda_seq
+        )
+
+    def stability_selection(self, X, y, n_models=20) -> Tuple[
+        List[List[HistoryItem]],
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.LongTensor],
+    ]:
+        """Compute stability selection paths to be passed to
+        `lassonet.utils.selection_probability`.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data
+        y : array-like of shape (n_samples,) or (n_samples, n_outputs)
+            Target values
+        n_models : int
+            Number of models to train
+
+        Returns
+        -------
+        oracle : int
+            Ideal number of features to select.
+        order: LongTensor
+            Order of the selected features.
+        wrong: Tensor
+            Expected number of wrong features.
+        paths: List[List[HistoryItem]]
+        prob: torch.Tensor
+            Tensor of shape (n_steps, n_features) containing the selection probability
+            of each feature at lambda value.
+        """
+        WRONG_THRESHOLD = 1 / 2
+
+        path = self._stability_selection_path(X, y)
+        lambda_seq = [it.lambda_ for it in path]
+        paths = [
+            self._stability_selection_path(X, y, lambda_seq)
+            for _ in tqdm(range(n_models), desc="Stability selection")
+        ]
+        prob, expected_wrong = selection_probability(paths)
+        order = expected_wrong.indices
+        wrong = expected_wrong.values
+        # you cannot get more features wrong than the number of selected features
+        # wrong = torch.minimum(wrong, torch.arange(1, len(wrong) + 1))
+
+        if wrong[0] > WRONG_THRESHOLD:
+            oracle = 0
+        else:
+            oracle = int(torch.argmax(wrong[1:] / wrong[:-1])) + 1
+
+        return oracle, order, wrong, paths, prob
 
     @staticmethod
     def _compute_feature_importances(path: List[HistoryItem]):
@@ -590,9 +705,36 @@ class LassoNetClassifier(
     ClassifierMixin,
     BaseLassoNet,
 ):
-    """Use LassoNet as classifier"""
+    """Use LassoNet as classifier
+
+    Parameters
+    ----------
+    class_weight : iterable of float, default=None
+        If specified, weights for different classes in training.
+        There must be one number per class.
+    """
 
     criterion = torch.nn.CrossEntropyLoss(reduction="mean")
+
+    def __init__(self, class_weight=None, **kwargs):
+        BaseLassoNet.__init__(self, **kwargs)
+
+        self.class_weight = class_weight
+
+        if class_weight is not None:
+            self.class_weight = torch.FloatTensor(self.class_weight).to(self.device)
+            self.criterion = torch.nn.CrossEntropyLoss(
+                weight=self.class_weight, reduction="mean"
+            )
+
+    __init__.__doc__ = BaseLassoNet.__init__.__doc__
+
+    def _init_model(self, X, y):
+        output_shape = self._output_shape(y)
+        if self.class_weight is not None:
+            assert output_shape == len(self.class_weight)
+
+        return super()._init_model(X, y)
 
     def _convert_y(self, y) -> torch.TensorType:
         y = torch.LongTensor(y).to(self.device)
@@ -623,9 +765,30 @@ class LassoNetClassifier(
 class LassoNetCoxRegressor(
     BaseLassoNet,
 ):
-    """Use LassoNet for Cox regression"""
+    """Use LassoNet for Cox regression
+
+    y has two dimensions: durations and events
+
+    Parameters
+    ----------
+    tie_approximation: str
+        Tie approximation for the Cox model, must be one of ("breslow", "efron").
+    """
 
     criterion = None
+
+    def __init__(self, tie_approximation=None, **kwargs):
+        BaseLassoNet.__init__(self, **kwargs)
+
+        assert self.batch_size is None, "Cox regression does not work with mini-batches"
+
+        self.tie_approximation = tie_approximation
+        assert (
+            tie_approximation in CoxPHLoss.allowed
+        ), f"`tie_approximation` must be one of {CoxPHLoss.allowed}"
+        self.criterion = CoxPHLoss(method=tie_approximation)
+
+    __init__.__doc__ = BaseLassoNet.__init__.__doc__
 
     def _convert_y(self, y):
         return torch.FloatTensor(y).to(self.device)
@@ -641,6 +804,75 @@ class LassoNetCoxRegressor(
         time, event = y_test.T
         risk = self.predict(X_test)
         return concordance_index(risk, time, event)
+
+
+class LassoNetIntervalRegressor(BaseLassoNet):
+    """Use LassoNet for Sparse Interval-Censored regression
+
+    y has 5 dimensions: latent_time_u, latent_time_v, delta_1, delta_2, delta_3
+
+    See https://arxiv.org/abs/2206.06885
+    """
+
+    class CustomLassoNet(LassoNet):
+        def __init__(self, *dims, groups=None, dropout=None):
+            super().__init__(*dims, groups=groups, dropout=dropout)
+            self.log_sigma = torch.nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, inp):
+            return super().forward(inp), torch.exp(self.log_sigma)
+
+    Fdist = torch.distributions.Normal(0, 1).cdf
+
+    def _convert_y(self, y):
+        y = torch.FloatTensor(y).to(self.device)
+        if len(y.shape) == 1:
+            y = y.view(-1, 1)
+        return y
+
+    def _output_shape(self, y):
+        return 1
+
+    def _init_model(self, X, y):
+        """Create a torch model"""
+        output_shape = self._output_shape(y)
+        if self.torch_seed is not None:
+            torch.manual_seed(self.torch_seed)
+        self.model = LassoNetIntervalRegressor.CustomLassoNet(
+            X.shape[1],
+            *self.hidden_dims,
+            output_shape,
+            groups=self.groups,
+            dropout=self.dropout,
+        ).to(self.device)
+
+    @classmethod
+    def criterion(self, output, y):
+        mo, sigma = output
+        mo = mo.squeeze()
+        us, vs, delta1, delta2, delta3 = y.T
+
+        fu = LassoNetIntervalRegressor.Fdist((torch.log(us) - mo) / sigma)
+        fv = LassoNetIntervalRegressor.Fdist((torch.log(vs) - mo) / sigma)
+        return -torch.mean(
+            delta1 * torch.log(fu + 1e-8)
+            + delta2 * torch.log(fv - fu + 1e-8)
+            + delta3 * torch.log(1 - fv + 1e-8)
+        )
+
+    def predict(self, X):
+        self.model.eval()
+        with torch.no_grad():
+            ans, _ = self.model(self._cast_input(X))
+        if isinstance(X, np.ndarray):
+            ans = ans.cpu().numpy()
+        return ans
+
+    def score(self, X_test, y_test):
+        """Concordance index"""
+        _, vs, _, _, delta3 = y_test.T
+        risk = -self.predict(X_test)
+        return concordance_index(risk, vs, (1 - delta3))
 
 
 class BaseLassoNetCV(BaseLassoNet, metaclass=ABCMeta):
@@ -663,6 +895,11 @@ class BaseLassoNetCV(BaseLassoNet, metaclass=ABCMeta):
         *,
         return_state_dicts=True,
     ):
+        if hasattr(X, "to_numpy"):
+            X = X.to_numpy()
+        if hasattr(y, "to_numpy"):
+            y = y.to_numpy()
+
         raw_lambdas_ = []
         self.raw_scores_ = []
         self.raw_paths_ = []
@@ -737,7 +974,6 @@ class BaseLassoNetCV(BaseLassoNet, metaclass=ABCMeta):
                 lambda_seq=[h.lambda_ for h in path[1:-1]],
                 return_state_dicts=return_state_dicts,
             )
-        self.path_ = path
 
         self.best_selected_ = path[-1].selected
         return path
@@ -764,6 +1000,10 @@ class LassoNetClassifierCV(BaseLassoNetCV, LassoNetClassifier):
 
 
 class LassoNetCoxRegressorCV(BaseLassoNetCV, LassoNetCoxRegressor):
+    pass
+
+
+class LassoNetIntervalRegressorCV(BaseLassoNetCV, LassoNetIntervalRegressor):
     pass
 
 

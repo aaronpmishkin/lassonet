@@ -1,8 +1,7 @@
-import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import r2_score
 import matplotlib.pyplot as plt
-
+import numpy as np
+from sklearn.metrics import r2_score
+from sklearn.preprocessing import StandardScaler
 
 from lassonet import LassoNetRegressor, plot_path
 
@@ -43,10 +42,12 @@ if __name__ == "__main__":
         hidden_dims=(10, 10),
         torch_seed=0,
     )
-    path = model.path(X_train, y_train, X_val=X_val, y_val=y_val)
+    path = model.path(
+        X_train, y_train, X_val=X_val, y_val=y_val, return_state_dicts=True
+    )
     print(
         "rrmse:",
         min(rrmse(y_test, model.load(save).predict(X_test)) for save in path),
     )
-    plot_path(model, path, X_test, y_test, score_function=rrmse)
+    plot_path(model, X_test, y_test, score_function=rrmse)
     plt.show()
